@@ -1,6 +1,7 @@
 ARG ALPINE_VERSION=3.8
+ARG GO_VERSION=1.11.4
 
-FROM alpine:${ALPINE_VERSION}
+FROM scratch as final
 ARG BUILD_DATE
 ARG VCS_REF
 LABEL org.label-schema.schema-version="1.0.0-rc1" \
@@ -22,30 +23,47 @@ ENV VERBOSITY=1 \
     VERBOSITY_DETAILS=0 \
     BLOCK_MALICIOUS=on \
     LISTENINGPORT=53
-ENTRYPOINT /etc/unbound/entrypoint.sh
-HEALTHCHECK --interval=5m --timeout=15s --start-period=5s --retries=1 \
-            CMD LISTENINGPORT=${LISTENINGPORT:-53}; [ -z $(nslookup duckduckgo.com 127.0.0.1 -port=$LISTENING_PORT -timeout=1 | grep "no servers could be reached") ] || exit 1
-RUN apk --update --no-cache --progress -q add unbound bind-tools libcap && \
-    setcap 'cap_net_bind_service=+ep' /usr/sbin/unbound && \
-    apk del libcap && \
-    rm -rf /var/cache/apk/* /etc/unbound/unbound.conf && \
+#ENTRYPOINT [ "/unbound" ]
+
+FROM alpine:${ALPINE_VERSION} as unbound
+WORKDIR /unbound
+RUN apk --update --no-cache --progress -q add ca-certificates wget build-base libressl-dev expat-dev && \
+    wget -q https://github.com/NLnetLabs/unbound/archive/master.tar.gz && \
+    tar -xzf master.tar.gz -C . --strip-components=1 && \
+    rm master.tar.gz && \
+    ./configure CFLAGS="-static" && \
+    make && \
+    strip unbound
+
+FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS entrypoint
+RUN apk --update add git build-base upx
+RUN go get -u -v golang.org/x/vgo
+WORKDIR /tmp/gobuild
+COPY entrypoint/go.mod entrypoint/go.sum ./
+RUN go mod download
+COPY entrypoint/*.go ./
+#RUN go test -v
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -ldflags="-s -w" -o app .
+
+FROM alpine:${ALPINE_VERSION} as extra
+RUN rm -rf /var/cache/apk/* /etc/unbound/unbound.conf && \
     adduser nonrootuser -D -H --uid 1000 && \
-    wget -q https://raw.githubusercontent.com/qdm12/updated/master/files/named.root.updated -O /etc/unbound/root.hints && \
-    wget -q https://raw.githubusercontent.com/qdm12/updated/master/files/root.key.updated -O /etc/unbound/root.key && \
-    cd /tmp && \
+    wget -q https://raw.githubusercontent.com/qdm12/updated/master/files/named.root.updated -O /root.hints && \
+    wget -q https://raw.githubusercontent.com/qdm12/updated/master/files/root.key.updated -O /root.key && \
     wget -q https://raw.githubusercontent.com/qdm12/updated/master/files/malicious-hostnames.updated -O malicious-hostnames && \
     wget -q https://raw.githubusercontent.com/qdm12/updated/master/files/malicious-ips.updated -O malicious-ips && \
     while read hostname; do echo "local-zone: \""$hostname"\" static" >> blocks-malicious.conf; done < malicious-hostnames && \
     while read ip; do echo "private-address: $ip" >> blocks-malicious.conf; done < malicious-ips && \
-    tar -cjf /etc/unbound/blocks-malicious.bz2 blocks-malicious.conf && \
-    rm -f /tmp/*
-COPY unbound.conf entrypoint.sh /etc/unbound/
-RUN chown nonrootuser -R /etc/unbound && \
-    chmod 700 /etc/unbound && \
-    chmod 500 /etc/unbound/entrypoint.sh && \
-    chmod 400 \
-        /etc/unbound/root.hints \
-        /etc/unbound/root.key \
-        /etc/unbound/unbound.conf \
-        /etc/unbound/blocks-malicious.bz2
-USER nonrootuser
+    tar -cjf blocks-malicious.bz2 blocks-malicious.conf && \
+    touch /include.conf
+
+FROM final
+#HEALTHCHECK --interval=5m --timeout=15s --start-period=5s --retries=1 \
+#            CMD LISTENINGPORT=${LISTENINGPORT:-53}; [ -z $(nslookup duckduckgo.com 127.0.0.1 -port=$LISTENING_PORT -timeout=1 | grep "no servers could be reached") ] || exit 1
+COPY --chown=1000:1000 --from=unbound /unbound/unbound /unbound
+COPY --chown=1000:1000 --from=entrypoint /tmp/gobuild/app /entrypoint
+COPY --chown=1000:1000 --from=extra /root.hints /root.key /blocks-malicious.bz2 /include.conf /
+COPY --chown=1000:1000 unbound.conf /unbound.conf
+#USER 1000
+
+FROM unbound
